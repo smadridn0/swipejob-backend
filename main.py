@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
-app = FastAPI(title="SwipeJob API Engine")
+app = FastAPI(title="SwipeJob Universal Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,12 +18,12 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://swipejob-n8n.onrender.com/webhook/swipe")
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://swipejob-n8n.onrender.com/webhook/webhook/swipe")
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-# MODELOS PYDANTIC
+# MODELOS DE DATOS
 class RegistroModel(BaseModel):
     nombre: str
     correo: str
@@ -60,6 +60,7 @@ class VacanteModel(BaseModel):
     salario: str
     modalidad: str
     ubicacion: Optional[str] = "Colombia"
+    tipo_contrato: Optional[str] = "Término indefinido"
 
 class SwipeModel(BaseModel):
     id_candidato: int
@@ -77,7 +78,7 @@ class EntrevistaModel(BaseModel):
     enlace_reunion: Optional[str] = None
     notas: Optional[str] = None
 
-# 1. AUTENTICACIÓN
+# AUTENTICACIÓN DINÁMICA
 @app.post("/api/registro")
 def registro(data: RegistroModel):
     conn = get_db()
@@ -95,7 +96,6 @@ def registro(data: RegistroModel):
             (data.nombre, data.correo, data.password, data.rol, data.telefono)
         )
         id_usuario = cur.fetchone()["id_usuario"]
-
         id_candidato = None
         id_empresa = None
 
@@ -138,11 +138,13 @@ def login(data: LoginModel):
         if user["rol"] == "candidato":
             cur.execute("SELECT id_candidato FROM candidatos WHERE id_usuario = %s", (user["id_usuario"],))
             cand = cur.fetchone()
-            if cand: id_candidato = cand["id_candidato"]
+            if cand:
+                id_candidato = cand["id_candidato"]
         else:
             cur.execute("SELECT id_empresa FROM empresas WHERE id_usuario = %s", (user["id_usuario"],))
             emp = cur.fetchone()
-            if emp: id_empresa = emp["id_empresa"]
+            if emp:
+                id_empresa = emp["id_empresa"]
 
         return {
             "id_usuario": user["id_usuario"],
@@ -156,7 +158,7 @@ def login(data: LoginModel):
         cur.close()
         conn.close()
 
-# 2. PERFIL Y CV CANDIDATO
+# PERFILES Y HOJA DE VIDA
 @app.get("/api/candidato/perfil/{id_candidato}")
 def obtener_perfil(id_candidato: int):
     conn = get_db()
@@ -171,8 +173,7 @@ def obtener_perfil(id_candidato: int):
             """,
             (id_candidato,)
         )
-        perfil = cur.fetchone()
-        return perfil or {}
+        return cur.fetchone() or {}
     finally:
         cur.close()
         conn.close()
@@ -197,7 +198,7 @@ def actualizar_perfil(data: PerfilModel):
                 (data.nombre, data.telefono, row["id_usuario"])
             )
         conn.commit()
-        return {"mensaje": "Perfil actualizado con éxito"}
+        return {"mensaje": "Perfil actualizado exitosamente"}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -243,7 +244,7 @@ def guardar_preferencias(data: PreferenciasModel):
             (data.id_candidato, data.cargo_deseado, data.ubicacion_deseada, data.empresas_interes, data.rango_salarial, data.modalidad, data.tipo_contrato)
         )
         conn.commit()
-        return {"mensaje": "Preferencias guardadas."}
+        return {"mensaje": "Preferencias registradas exitosamente"}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -251,7 +252,7 @@ def guardar_preferencias(data: PreferenciasModel):
         cur.close()
         conn.close()
 
-# 3. FEED Y VACANTES
+# VACANTES
 @app.get("/api/vacantes/feed/{id_candidato}")
 def feed_vacantes(id_candidato: int):
     conn = get_db()
@@ -274,8 +275,7 @@ def feed_vacantes(id_candidato: int):
             """,
             (id_candidato,)
         )
-        vacantes = cur.fetchall()
-        return {"requiere_cv": False, "vacantes": vacantes}
+        return {"requiere_cv": False, "vacantes": cur.fetchall()}
     finally:
         cur.close()
         conn.close()
@@ -287,13 +287,13 @@ def crear_vacante(data: VacanteModel):
     try:
         cur.execute(
             """
-            INSERT INTO vacantes (id_empresa, titulo, descripcion, requisitos, salario, modalidad, ubicacion)
-            VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id_vacante
+            INSERT INTO vacantes (id_empresa, titulo, descripcion, requisitos, salario, modalidad, ubicacion, tipo_contrato)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id_vacante
             """,
-            (data.id_empresa, data.titulo, data.descripcion, data.requisitos, data.salario, data.modalidad, data.ubicacion)
+            (data.id_empresa, data.titulo, data.descripcion, data.requisitos, data.salario, data.modalidad, data.ubicacion, data.tipo_contrato)
         )
         conn.commit()
-        return {"mensaje": "Vacante creada exitosamente"}
+        return {"mensaje": "Vacante publicada exitosamente"}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -301,7 +301,7 @@ def crear_vacante(data: VacanteModel):
         cur.close()
         conn.close()
 
-# 4. SWIPES, NOTIFICACIONES Y WEBHOOK N8N
+# SWIPES Y DISPARO UNIVERSAL A N8N
 @app.post("/api/swipes")
 def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
     conn = get_db()
@@ -309,7 +309,7 @@ def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
     afinidad_segura = data.afinidad if data.afinidad is not None else 0
 
     try:
-        # Registrar Swipe en matches
+        # Registrar en matches
         cur.execute(
             """
             INSERT INTO matches (id_candidato, id_vacante, decision, afinidad)
@@ -328,67 +328,46 @@ def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
                 (data.id_candidato, data.id_vacante, afinidad_segura)
             )
 
-            # Obtener datos de candidato y empresa
-            cur.execute(
-                """
-                SELECT c.id_usuario, u.nombre, u.correo 
-                FROM candidatos c 
-                JOIN usuarios u ON c.id_usuario = u.id_usuario 
-                WHERE c.id_candidato = %s
-                """,
-                (data.id_candidato,)
-            )
-            candidato = cur.fetchone()
+            # Notificaciones In-App para ambos usuarios
+            cur.execute("SELECT id_usuario FROM candidatos WHERE id_candidato = %s", (data.id_candidato,))
+            cand_user = cur.fetchone()
 
             cur.execute(
                 """
-                SELECT v.titulo, e.nombre as empresa_nombre, u.correo as empresa_correo, e.id_usuario as empresa_id_usuario
+                SELECT e.id_usuario 
                 FROM vacantes v 
                 JOIN empresas e ON v.id_empresa = e.id_empresa 
-                JOIN usuarios u ON e.id_usuario = u.id_usuario 
                 WHERE v.id_vacante = %s
                 """,
                 (data.id_vacante,)
             )
-            vacante = cur.fetchone()
+            emp_user = cur.fetchone()
 
-            # Crear notificación In-App para el candidato
-            if candidato:
+            if cand_user:
                 cur.execute(
-                    """
-                    INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje)
-                    VALUES (%s, 'match', 'Postulación Enviada', %s)
-                    """,
-                    (candidato["id_usuario"], f"Te has postulado exitosamente a {vacante['titulo']} en {vacante['empresa_nombre']} ({afinidad_segura}% afinidad).")
+                    "INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje) VALUES (%s, 'match', 'Postulación Enviada', 'Tu postulación se ha registrado exitosamente.')",
+                    (cand_user["id_usuario"],)
                 )
-
-            # Crear notificación In-App para la empresa
-            if vacante:
+            if emp_user:
                 cur.execute(
-                    """
-                    INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje)
-                    VALUES (%s, 'postulacion', 'Nuevo Postulante', %s)
-                    """,
-                    (vacante["empresa_id_usuario"], f"{candidato['nombre']} ha aplicado a tu vacante {vacante['titulo']} ({afinidad_segura}% afinidad).")
+                    "INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje) VALUES (%s, 'postulacion', 'Nuevo Postulante', 'Un candidato ha aplicado a una de tus vacantes activas.')",
+                    (emp_user["id_usuario"],)
                 )
 
             conn.commit()
 
-            # Disparo a n8n en background task
+            # Despacho en segundo plano a n8n únicamente con los IDs de la operación
             def emitir_n8n():
                 try:
                     payload = {
                         "evento": "nuevo_swipe_like",
-                        "candidato_nombre": candidato["nombre"] if candidato else "Kelvin Restrepo",
-                        "candidato_correo": candidato["correo"] if candidato else "",
-                        "vacante_titulo": vacante["titulo"] if vacante else "Desarrollador Backend",
-                        "empresa_nombre": vacante["empresa_nombre"] if vacante else "Tech Innovators S.A.S.",
-                        "empresa_correo": vacante["empresa_correo"] if vacante else "",
+                        "id_candidato": data.id_candidato,
+                        "id_vacante": data.id_vacante,
                         "afinidad": afinidad_segura
                     }
-                    requests.post(N8N_WEBHOOK_URL, json=payload, timeout=5)
+                    requests.post(N8N_WEBHOOK_URL, json=payload, timeout=6)
                 except Exception as err:
-                    print(f"n8n webhook error: {err}")
+                    print(f"Error conectando con n8n: {err}")
 
             background_tasks.add_task(emitir_n8n)
         else:
@@ -402,7 +381,7 @@ def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
         cur.close()
         conn.close()
 
-# 5. HISTORIAL Y POSTULACIONES
+# HISTORIAL DE POSTULACIONES
 @app.get("/api/candidato/postulaciones/{id_candidato}")
 def historial_candidato(id_candidato: int):
     conn = get_db()
@@ -446,7 +425,7 @@ def postulaciones_empresa(id_empresa: int):
         cur.close()
         conn.close()
 
-# 6. ENTREVISTAS
+# ENTREVISTAS
 @app.post("/api/empresa/entrevistas")
 def programar_entrevista(data: EntrevistaModel, background_tasks: BackgroundTasks):
     conn = get_db()
@@ -460,36 +439,23 @@ def programar_entrevista(data: EntrevistaModel, background_tasks: BackgroundTask
             (data.id_candidato, data.id_empresa, data.id_postulacion, data.titulo, data.fecha_hora, data.modalidad, data.enlace_reunion, data.notas)
         )
         id_entrevista = cur.fetchone()["id_entrevista"]
-
-        cur.execute(
-            """
-            SELECT u.nombre as candidato_nombre, u.correo as candidato_correo, e.nombre as empresa_nombre
-            FROM candidatos c
-            JOIN usuarios u ON c.id_usuario = u.id_usuario
-            JOIN empresas e ON e.id_empresa = %s
-            WHERE c.id_candidato = %s
-            """,
-            (data.id_empresa, data.id_candidato)
-        )
-        info = cur.fetchone()
         conn.commit()
 
-        def emitir_entrevista_n8n():
+        def emitir_cita_n8n():
             try:
                 requests.post(N8N_WEBHOOK_URL, json={
                     "evento": "entrevista_agendada",
-                    "candidato_nombre": info["candidato_nombre"],
-                    "candidato_correo": info["candidato_correo"],
-                    "empresa_nombre": info["empresa_nombre"],
+                    "id_candidato": data.id_candidato,
+                    "id_empresa": data.id_empresa,
                     "titulo": data.titulo,
                     "fecha_hora": data.fecha_hora,
                     "enlace_reunion": data.enlace_reunion
-                }, timeout=5)
+                }, timeout=6)
             except Exception as err:
-                print(f"Error n8n entrevista: {err}")
+                print(f"Error despachando cita a n8n: {err}")
 
-        background_tasks.add_task(emitir_entrevista_n8n)
-        return {"id_entrevista": id_entrevista, "mensaje": "Entrevista programada exitosamente"}
+        background_tasks.add_task(emitir_cita_n8n)
+        return {"id_entrevista": id_entrevista, "mensaje": "Entrevista agendada exitosamente"}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -550,7 +516,7 @@ def confirmar_entrevista(id_entrevista: int):
         cur.close()
         conn.close()
 
-# 7. NOTIFICACIONES IN-APP
+# NOTIFICACIONES
 @app.get("/api/candidato/notificaciones/{id_usuario}")
 def listar_notificaciones(id_usuario: int):
     conn = get_db()
