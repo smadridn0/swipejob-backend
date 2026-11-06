@@ -1,13 +1,15 @@
 import os
+import re
+import math
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 
-app = FastAPI(title="SwipeJob Universal Engine")
+app = FastAPI(title="SwipeJob Semantic Matching Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,12 +20,60 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://swipejob-n8n.onrender.com/webhook/webhook/swipe")
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://swipejob-n8n.onrender.com/webhook/swipe")
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-# MODELOS DE DATOS
+def normalizar_texto(texto: str) -> set:
+    if not texto:
+        return set()
+    tokens = re.findall(r'\b[a-záéíóúñ0-9+#\.]+\b', texto.lower())
+    stopwords = {"de", "la", "el", "en", "y", "a", "que", "los", "del", "se", "las", "por", "un", "para", "con", "no", "una", "su", "al", "es"}
+    return {t for t in tokens if t not in stopwords and len(t) > 1}
+
+def calcular_matching_semantico(cv_texto: str, vacante_titulo: str, vacante_req: str, vacante_desc: str,
+                                pref_mod: str, vac_mod: str, pref_cont: str, vac_cont: str) -> Dict[str, Any]:
+    # 1. Similitud Semántica de Contenido (50%)
+    tokens_cv = normalizar_texto(cv_texto)
+    texto_vacante = f"{vacante_titulo} {vacante_req} {vacante_desc}"
+    tokens_vac = normalizar_texto(texto_vacante)
+    
+    interseccion = tokens_cv.intersection(tokens_vac)
+    union = tokens_cv.union(tokens_vac)
+    similitud_jaccard = (len(interseccion) / len(union)) if union else 0.0
+    
+    # Coeficiente no lineal para recompensar solapamiento técnico relevante
+    score_semantico = min(50.0, (math.sqrt(similitud_jaccard) * 1.6) * 50.0)
+    
+    # 2. Fit de Modalidad y Contrato (30%)
+    score_condiciones = 0.0
+    if pref_mod and vac_mod and (pref_mod.lower() in vac_mod.lower() or vac_mod.lower() in pref_mod.lower()):
+        score_condiciones += 15.0
+    elif "híbrido" in str(vac_mod).lower() or "remoto" in str(vac_mod).lower():
+        score_condiciones += 10.0
+        
+    if pref_cont and vac_cont and (pref_cont.lower() in vac_cont.lower() or vac_cont.lower() in pref_cont.lower()):
+        score_condiciones += 15.0
+    else:
+        score_condiciones += 8.0
+        
+    # 3. Base de compatibilidad estructural (20%)
+    score_perfil = 15.0 if len(tokens_cv) > 15 else 5.0
+    
+    total = round(min(100.0, score_semantico + score_condiciones + score_perfil), 1)
+    
+    return {
+        "afinidad": total,
+        "desglose": {
+            "score_semantico_competencias": round(score_semantico, 1),
+            "score_condiciones_laborales": round(score_condiciones, 1),
+            "score_calidad_perfil": round(score_perfil, 1),
+            "keywords_coincidentes": list(interseccion)[:8]
+        }
+    }
+
+# MODELOS PYDANTIC
 class RegistroModel(BaseModel):
     nombre: str
     correo: str
@@ -66,7 +116,7 @@ class SwipeModel(BaseModel):
     id_candidato: int
     id_vacante: int
     decision: str
-    afinidad: Optional[int] = 0
+    afinidad: Optional[float] = None
 
 class EntrevistaModel(BaseModel):
     id_candidato: int
@@ -78,7 +128,7 @@ class EntrevistaModel(BaseModel):
     enlace_reunion: Optional[str] = None
     notas: Optional[str] = None
 
-# AUTENTICACIÓN DINÁMICA
+# ENDPOINTS
 @app.post("/api/registro")
 def registro(data: RegistroModel):
     conn = get_db()
@@ -158,7 +208,6 @@ def login(data: LoginModel):
         cur.close()
         conn.close()
 
-# PERFILES Y HOJA DE VIDA
 @app.get("/api/candidato/perfil/{id_candidato}")
 def obtener_perfil(id_candidato: int):
     conn = get_db()
@@ -199,9 +248,6 @@ def actualizar_perfil(data: PerfilModel):
             )
         conn.commit()
         return {"mensaje": "Perfil actualizado exitosamente"}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()
         conn.close()
@@ -218,15 +264,14 @@ async def subir_cv(id_candidato: int = Form(...), archivo: UploadFile = File(...
             """
             INSERT INTO hojas_vida (id_candidato, nombre_archivo, contenido_texto)
             VALUES (%s, %s, %s)
+            ON CONFLICT (id_candidato) DO UPDATE 
+            SET nombre_archivo = EXCLUDED.nombre_archivo, contenido_texto = EXCLUDED.contenido_texto
             """,
             (id_candidato, archivo.filename, texto)
         )
         cur.execute("UPDATE candidatos SET cv_nombre = %s WHERE id_candidato = %s", (archivo.filename, id_candidato))
         conn.commit()
         return {"mensaje": f"Archivo {archivo.filename} cargado exitosamente."}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()
         conn.close()
@@ -245,14 +290,10 @@ def guardar_preferencias(data: PreferenciasModel):
         )
         conn.commit()
         return {"mensaje": "Preferencias registradas exitosamente"}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()
         conn.close()
 
-# VACANTES
 @app.get("/api/vacantes/feed/{id_candidato}")
 def feed_vacantes(id_candidato: int):
     conn = get_db()
@@ -263,9 +304,17 @@ def feed_vacantes(id_candidato: int):
         if not cand or not cand["cv_nombre"]:
             return {"requiere_cv": True, "vacantes": []}
 
+        # Extraer CV y preferencias para cálculo semántico preliminar
+        cur.execute("SELECT contenido_texto FROM hojas_vida WHERE id_candidato = %s", (id_candidato,))
+        hv = cur.fetchone()
+        cv_texto = hv["contenido_texto"] if hv else ""
+
+        cur.execute("SELECT * FROM preferencias_candidato WHERE id_candidato = %s ORDER BY id_preferencia DESC LIMIT 1", (id_candidato,))
+        pref = cur.fetchone() or {}
+
         cur.execute(
             """
-            SELECT v.id_vacante, v.titulo, v.descripcion, v.requisitos, v.salario, v.modalidad, v.ubicacion, e.nombre as nombre_empresa
+            SELECT v.id_vacante, v.titulo, v.descripcion, v.requisitos, v.salario, v.modalidad, v.ubicacion, v.tipo_contrato, e.nombre as nombre_empresa
             FROM vacantes v
             JOIN empresas e ON v.id_empresa = e.id_empresa
             WHERE v.id_vacante NOT IN (
@@ -275,7 +324,28 @@ def feed_vacantes(id_candidato: int):
             """,
             (id_candidato,)
         )
-        return {"requiere_cv": False, "vacantes": cur.fetchall()}
+        vacantes_raw = cur.fetchall()
+        vacantes_procesadas = []
+
+        for v in vacantes_raw:
+            match_res = calcular_matching_semantico(
+                cv_texto=cv_texto,
+                vacante_titulo=v["titulo"],
+                vacante_req=v["requisitos"],
+                vacante_desc=v["descripcion"],
+                pref_mod=pref.get("modalidad", "Remoto"),
+                vac_mod=v["modalidad"],
+                pref_cont=pref.get("tipo_contrato", "Término indefinido"),
+                vac_cont=v["tipo_contrato"]
+            )
+            v_dict = dict(v)
+            v_dict["afinidad_estimada"] = match_res["afinidad"]
+            v_dict["desglose_match"] = match_res["desglose"]
+            vacantes_procesadas.append(v_dict)
+
+        # Ordenar feed descendentemente por afinidad semántica
+        vacantes_procesadas.sort(key=lambda x: x["afinidad_estimada"], reverse=True)
+        return {"requiere_cv": False, "vacantes": vacantes_procesadas}
     finally:
         cur.close()
         conn.close()
@@ -294,22 +364,17 @@ def crear_vacante(data: VacanteModel):
         )
         conn.commit()
         return {"mensaje": "Vacante publicada exitosamente"}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()
         conn.close()
 
-# SWIPES Y DISPARO UNIVERSAL A N8N
 @app.post("/api/swipes")
 def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
     conn = get_db()
     cur = conn.cursor()
-    afinidad_segura = data.afinidad if data.afinidad is not None else 0
-
     try:
-        # Registrar en matches
+        afinidad_segura = data.afinidad if data.afinidad is not None else 0.0
+
         cur.execute(
             """
             INSERT INTO matches (id_candidato, id_vacante, decision, afinidad)
@@ -319,7 +384,6 @@ def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
         )
 
         if data.decision == "like":
-            # Registrar en postulaciones
             cur.execute(
                 """
                 INSERT INTO postulaciones (id_candidato, id_vacante, estado, afinidad)
@@ -328,35 +392,34 @@ def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
                 (data.id_candidato, data.id_vacante, afinidad_segura)
             )
 
-            # Notificaciones In-App para ambos usuarios
+            # Notificaciones In-App directas
             cur.execute("SELECT id_usuario FROM candidatos WHERE id_candidato = %s", (data.id_candidato,))
             cand_user = cur.fetchone()
 
             cur.execute(
                 """
-                SELECT e.id_usuario 
+                SELECT e.id_usuario, v.titulo 
                 FROM vacantes v 
                 JOIN empresas e ON v.id_empresa = e.id_empresa 
                 WHERE v.id_vacante = %s
                 """,
                 (data.id_vacante,)
             )
-            emp_user = cur.fetchone()
+            emp_info = cur.fetchone()
 
-            if cand_user:
+            if cand_user and emp_info:
                 cur.execute(
-                    "INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje) VALUES (%s, 'match', 'Postulación Enviada', 'Tu postulación se ha registrado exitosamente.')",
-                    (cand_user["id_usuario"],)
+                    "INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje) VALUES (%s, 'match', 'Postulación Enviada', %s)",
+                    (cand_user["id_usuario"], f"Te has postulado con éxito a la vacante {emp_info['titulo']}.")
                 )
-            if emp_user:
                 cur.execute(
-                    "INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje) VALUES (%s, 'postulacion', 'Nuevo Postulante', 'Un candidato ha aplicado a una de tus vacantes activas.')",
-                    (emp_user["id_usuario"],)
+                    "INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje) VALUES (%s, 'postulacion', 'Nuevo Postulante', %s)",
+                    (emp_info["id_usuario"], f"Un candidato se ha postulado con {afinidad_segura}% de afinidad a {emp_info['titulo']}.")
                 )
 
             conn.commit()
 
-            # Despacho en segundo plano a n8n únicamente con los IDs de la operación
+            # Despacho en segundo plano a n8n para análisis semántico en n8n y envío de correos
             def emitir_n8n():
                 try:
                     payload = {
@@ -365,15 +428,15 @@ def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
                         "id_vacante": data.id_vacante,
                         "afinidad": afinidad_segura
                     }
-                    requests.post(N8N_WEBHOOK_URL, json=payload, timeout=6)
+                    requests.post(N8N_WEBHOOK_URL, json=payload, timeout=8)
                 except Exception as err:
-                    print(f"Error conectando con n8n: {err}")
+                    print(f"Error despachando a n8n: {err}")
 
             background_tasks.add_task(emitir_n8n)
         else:
             conn.commit()
 
-        return {"status": "ok", "mensaje": "Swipe procesado"}
+        return {"status": "ok", "afinidad": afinidad_segura}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -381,7 +444,6 @@ def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
         cur.close()
         conn.close()
 
-# HISTORIAL DE POSTULACIONES
 @app.get("/api/candidato/postulaciones/{id_candidato}")
 def historial_candidato(id_candidato: int):
     conn = get_db()
@@ -416,7 +478,7 @@ def postulaciones_empresa(id_empresa: int):
             JOIN candidatos c ON p.id_candidato = c.id_candidato
             JOIN usuarios u ON c.id_usuario = u.id_usuario
             WHERE v.id_empresa = %s
-            ORDER BY p.id_postulacion DESC
+            ORDER BY p.afinidad DESC, p.id_postulacion DESC
             """,
             (id_empresa,)
         )
@@ -425,7 +487,6 @@ def postulaciones_empresa(id_empresa: int):
         cur.close()
         conn.close()
 
-# ENTREVISTAS
 @app.post("/api/empresa/entrevistas")
 def programar_entrevista(data: EntrevistaModel, background_tasks: BackgroundTasks):
     conn = get_db()
@@ -450,15 +511,12 @@ def programar_entrevista(data: EntrevistaModel, background_tasks: BackgroundTask
                     "titulo": data.titulo,
                     "fecha_hora": data.fecha_hora,
                     "enlace_reunion": data.enlace_reunion
-                }, timeout=6)
+                }, timeout=8)
             except Exception as err:
                 print(f"Error despachando cita a n8n: {err}")
 
         background_tasks.add_task(emitir_cita_n8n)
         return {"id_entrevista": id_entrevista, "mensaje": "Entrevista agendada exitosamente"}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()
         conn.close()
@@ -516,7 +574,6 @@ def confirmar_entrevista(id_entrevista: int):
         cur.close()
         conn.close()
 
-# NOTIFICACIONES
 @app.get("/api/candidato/notificaciones/{id_usuario}")
 def listar_notificaciones(id_usuario: int):
     conn = get_db()
