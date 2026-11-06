@@ -1,385 +1,186 @@
 import os
-import io
-import json
-import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import httpx
+from abc import ABC, abstractmethod
 from typing import Optional, List
-from pypdf import PdfReader
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status
+from pydantic import BaseModel
+from datetime import datetime
 
-app = FastAPI(title="SwipeJob API", version="3.3.0")
+# =====================================================================
+# PATRÓN STRATEGY: Algoritmo de Compatibilidad (Clean Code & SOLID)
+# =====================================================================
+class EstrategiaMatching(ABC):
+    @abstractmethod
+    def calcular(self, cv_texto: str, requisitos: str, pref: dict, vacante: dict) -> float:
+        pass
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class EstrategiaHibridaPonderada(EstrategiaMatching):
+    """Ponderación: 70% competencias técnicas del CV y 30% preferencias laborales."""
+    def __init__(self, peso_cv: float = 0.70, peso_pref: float = 0.30):
+        self.peso_cv = peso_cv
+        self.peso_pref = peso_pref
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
+    def calcular(self, cv_texto: str, requisitos: str, pref: dict, vacante: dict) -> float:
+        req_list = [r.strip().lower() for r in requisitos.split(",") if r.strip()]
+        afinidad_cv = 100.0
+        if req_list:
+            coincidencias = sum(1 for r in req_list if r in cv_texto.lower())
+            afinidad_cv = (coincidencias / len(req_list)) * 100.0
 
-def get_db():
-    if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL no configurada en las variables de entorno.")
+        puntos_pref = 0
+        if pref.get("modalidad", "").lower() == vacante.get("modalidad", "").lower():
+            puntos_pref += 1
+        if pref.get("ubicacion", "").lower() == vacante.get("ubicacion", "").lower():
+            puntos_pref += 1
+        if pref.get("tipo_contrato", "").lower() == vacante.get("tipo_contrato", "").lower():
+            puntos_pref += 1
+        afinidad_pref = (puntos_pref / 3.0) * 100.0
+
+        return round((afinidad_cv * self.peso_cv) + (afinidad_pref * self.peso_pref), 2)
+
+class ServicioScoring:
+    def __init__(self, estrategia: EstrategiaMatching):
+        self.estrategia = estrategia
+        self.version_modelo = "v1.2-hibrida"
+
+    def evaluar(self, cv: str, req: str, pref: dict, vac: dict) -> float:
+        return self.estrategia.calcular(cv, req, pref, vac)
+
+# =====================================================================
+# PATRÓN OBSERVER: Webhook desacoplado a n8n
+# =====================================================================
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://swipejob-n8n.onrender.com/webhook/swipe")
+
+async def notificar_observer_n8n(payload: dict):
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        return conn
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(N8N_WEBHOOK_URL, json=payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al conectar con la base de datos: {str(e)}")
+        print(f"[Observer Warning] n8n no respondió o está en suspensión: {e}")
 
-# Modelos Pydantic
-class LoginRequest(BaseModel):
-    correo: str
-    password: str
-
-class RegistroRequest(BaseModel):
-    nombre: str
-    correo: str
-    password: str
-    rol: str
-    telefono: Optional[str] = ""
-
-class PerfilUpdateRequest(BaseModel):
-    id_candidato: int
-    nombre: str
-    telefono: str
-    estudios: str
-    proyeccion: str
-    perfil_profesional: str
-
-class PreferenciasRequest(BaseModel):
-    id_candidato: int
-    cargo_deseado: str
-    ubicacion_deseada: str
-    empresas_interes: str
-    rango_salarial: str
-    modalidad: str
-    tipo_contrato: str
-
-class VacanteRequest(BaseModel):
-    id_empresa: int
-    titulo: str
-    descripcion: str
-    requisitos: str
-    salario: str
-    modalidad: str
-    ubicacion: str
-
-class SwipeRequest(BaseModel):
+# =====================================================================
+# MODELOS PYDANTIC
+# =====================================================================
+class SwipeInput(BaseModel):
     id_candidato: int
     id_vacante: int
-    decision: str
+    decision: str  # 'like' o 'dislike'
 
-@app.get("/")
-def ruta_raiz():
-    return {"status": "SwipeJob API online", "version": "3.3.0"}
+class EntrevistaInput(BaseModel):
+    id_candidato: int
+    id_empresa: int
+    id_postulacion: Optional[int] = None
+    titulo: str
+    fecha_hora: datetime
+    modalidad: Optional[str] = "Remoto"
+    enlace_reunion: Optional[str] = None
+    ubicacion: Optional[str] = None
+    notas: Optional[str] = None
 
-# HU-01: Autenticación
-@app.post("/api/login")
-def login(req: LoginRequest):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id_usuario, nombre, correo, password, rol FROM usuarios WHERE correo = %s", (req.correo,))
-    user = cur.fetchone()
-    if not user or user["password"] != req.password:
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+# =====================================================================
+# ENDPOINTS REST (PATRÓN FACHADA / FACADE)
+# =====================================================================
 
-    id_candidato = None
-    id_empresa = None
-    if user["rol"] == "candidato":
-        cur.execute("SELECT id_candidato FROM candidatos WHERE id_usuario = %s", (user["id_usuario"],))
-        c = cur.fetchone()
-        if c: id_candidato = c["id_candidato"]
-    else:
-        cur.execute("SELECT id_empresa FROM empleadores WHERE id_usuario = %s", (user["id_usuario"],))
-        e = cur.fetchone()
-        if e: id_empresa = e["id_empresa"]
-
-    cur.close()
-    conn.close()
-    return {
-        "id_usuario": user["id_usuario"],
-        "nombre": user["nombre"],
-        "correo": user["correo"],
-        "rol": user["rol"],
-        "id_candidato": id_candidato,
-        "id_empresa": id_empresa
-    }
-
-# HU-01 & HU-02: Registro
-@app.post("/api/registro")
-def registro(req: RegistroRequest):
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT id_usuario FROM usuarios WHERE correo = %s", (req.correo,))
-        if cur.fetchone():
-            raise HTTPException(status_code=400, detail="El correo ya se encuentra registrado.")
-
-        cur.execute("""
-            INSERT INTO usuarios (nombre, correo, password, rol)
-            VALUES (%s, %s, %s, %s) RETURNING id_usuario;
-        """, (req.nombre, req.correo, req.password, req.rol))
-        user_id = cur.fetchone()["id_usuario"]
-
-        id_candidato = None
-        id_empresa = None
-
-        if req.rol == "candidato":
-            cur.execute("""
-                INSERT INTO candidatos (id_usuario, telefono, perfil_profesional, ubicacion, experiencia_years, estudios, proyeccion)
-                VALUES (%s, %s, 'Perfil inicial', 'Colombia', 1, 'Estudiante de Ingeniería de Sistemas', 'Desarrollador orientado a cloud y arquitecturas backend')
-                RETURNING id_candidato;
-            """, (user_id, req.telefono))
-            id_candidato = cur.fetchone()["id_candidato"]
-
-            cur.execute("""
-                INSERT INTO preferencias (id_candidato, cargo_deseado, ubicacion_deseada, empresas_interes, rango_salarial, modalidad, tipo_contrato)
-                VALUES (%s, 'Desarrollador de software', 'Medellín', 'Nutresa', '2.500.000 CP - 7.500.000 CP', 'Remoto', 'Término indefinido')
-                ON CONFLICT (id_candidato) DO NOTHING;
-            """, (id_candidato,))
-        else:
-            cur.execute("""
-                INSERT INTO empresas (nombre, sector, descripcion, ubicacion_empresa, nit)
-                VALUES (%s, 'Tecnología', 'Empresa Verificada', 'Colombia', %s) RETURNING id_empresa;
-            """, (req.nombre, f"NIT-{user_id}"))
-            id_empresa = cur.fetchone()["id_empresa"]
-            cur.execute("INSERT INTO empleadores (id_usuario, id_empresa, cargo) VALUES (%s, %s, 'Reclutador')", (user_id, id_empresa))
-
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"id_usuario": user_id, "nombre": req.nombre, "correo": req.correo, "rol": req.rol, "id_candidato": id_candidato, "id_empresa": id_empresa}
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# HU-02: Perfil
-@app.get("/api/candidato/perfil/{id_candidato}")
-def obtener_perfil(id_candidato: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT c.id_candidato, u.nombre, u.correo, c.telefono, c.estudios, c.proyeccion, c.perfil_profesional,
-               hv.url_archivo AS cv_nombre, hv.fecha_subida AS cv_fecha
-        FROM candidatos c
-        JOIN usuarios u ON c.id_usuario = u.id_usuario
-        LEFT JOIN (
-            SELECT id_candidato, url_archivo, fecha_subida FROM hojas_vida ORDER BY id_cv DESC LIMIT 1
-        ) hv ON hv.id_candidato = c.id_candidato
-        WHERE c.id_candidato = %s;
-    """, (id_candidato,))
-    perfil = cur.fetchone()
-    cur.close()
-    conn.close()
-    return perfil or {}
-
-@app.put("/api/candidato/perfil")
-def actualizar_perfil(req: PerfilUpdateRequest):
-    conn = get_db()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            UPDATE candidatos 
-            SET telefono = %s, estudios = %s, proyeccion = %s, perfil_profesional = %s 
-            WHERE id_candidato = %s RETURNING id_usuario;
-        """, (req.telefono, req.estudios, req.proyeccion, req.perfil_profesional, req.id_candidato))
-        user_row = cur.fetchone()
-        if user_row:
-            cur.execute("UPDATE usuarios SET nombre = %s WHERE id_usuario = %s", (req.nombre, user_row["id_usuario"]))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"status": "ok", "mensaje": "Perfil actualizado exitosamente"}
-    except Exception as e:
-        conn.rollback()
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# HU-04: Preferencias
-@app.post("/api/candidato/preferencias")
-def guardar_preferencias(req: PreferenciasRequest):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO preferencias (id_candidato, cargo_deseado, ubicacion_deseada, empresas_interes, rango_salarial, modalidad, tipo_contrato)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id_candidato) DO UPDATE 
-        SET cargo_deseado = EXCLUDED.cargo_deseado,
-            ubicacion_deseada = EXCLUDED.ubicacion_deseada,
-            empresas_interes = EXCLUDED.empresas_interes,
-            rango_salarial = EXCLUDED.rango_salarial,
-            modalidad = EXCLUDED.modalidad,
-            tipo_contrato = EXCLUDED.tipo_contrato;
-    """, (req.id_candidato, req.cargo_deseado, req.ubicacion_deseada, req.empresas_interes, req.rango_salarial, req.modalidad, req.tipo_contrato))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"status": "ok", "mensaje": "Preferencias de interés actualizadas"}
-
-# HU-03: CV Parsing
-@app.post("/api/candidato/cv")
-async def subir_cv(id_candidato: int = Form(...), archivo: UploadFile = File(...)):
-    conn = get_db()
-    cur = conn.cursor()
-    contenido = await archivo.read()
-    nombre = archivo.filename
-    texto = ""
-
-    if nombre.lower().endswith(".pdf"):
-        try:
-            reader = PdfReader(io.BytesIO(contenido))
-            for page in reader.pages:
-                t = page.extract_text()
-                if t: texto += t + " "
-        except Exception:
-            texto = ""
-    else:
-        try: texto = contenido.decode("utf-8", errors="ignore")
-        except Exception: texto = ""
-
-    texto_limpio = " ".join(texto.split())
-    if not texto_limpio:
-        texto_limpio = f"Hoja de vida: {nombre}. Competencias y perfil profesional técnico."
-
-    cur.execute("INSERT INTO hojas_vida (id_candidato, url_archivo, texto_extraido, fecha_subida) VALUES (%s, %s, %s, NOW());", (id_candidato, nombre, texto_limpio))
-    cur.execute("UPDATE candidatos SET perfil_profesional = %s WHERE id_candidato = %s;", (texto_limpio[:2500], id_candidato))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"status": "success", "mensaje": f"CV '{nombre}' procesado exitosamente."}
-
-# HU-06: Feed Condicionado por Hoja de Vida
-@app.get("/api/vacantes/feed/{id_candidato}")
-def feed_candidato(id_candidato: int):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT hv.texto_extraido, c.perfil_profesional
-        FROM candidatos c
-        LEFT JOIN hojas_vida hv ON hv.id_candidato = c.id_candidato
-        WHERE c.id_candidato = %s ORDER BY hv.id_cv DESC LIMIT 1;
-    """, (id_candidato,))
-    c = cur.fetchone()
-    texto_cv = f"{c.get('texto_extraido') or ''} {c.get('perfil_profesional') or ''}".lower() if c else ""
-
-    if not texto_cv.strip() or "sin subir" in texto_cv:
-        cur.close()
-        conn.close()
-        return {"requiere_cv": True, "vacantes": []}
-
-    cur.execute("""
-        SELECT v.*, e.nombre AS nombre_empresa
-        FROM vacantes v
-        JOIN empresas e ON v.id_empresa = e.id_empresa
-        WHERE v.id_vacante NOT IN (
-            SELECT id_vacante FROM postulaciones WHERE id_candidato = %s
-        ) AND v.estado = 'activa' ORDER BY v.id_vacante DESC;
-    """, (id_candidato,))
-    vacantes = cur.fetchall()
-
-    filtradas = []
-    for vac in vacantes:
-        req = f"{vac.get('titulo', '')} {vac.get('requisitos', '')}".lower()
-        palabras = [p.strip(".,;:()") for p in req.split() if len(p.strip(".,;:()")) > 3]
-        matches = [p for p in palabras if p in texto_cv]
-        if len(matches) >= 1 or len(palabras) <= 2:
-            filtradas.append(vac)
-
-    cur.close()
-    conn.close()
-    return {"requiere_cv": False, "vacantes": filtradas}
-
-# HU-11: Historial de Postulaciones (Portafolio)
-@app.get("/api/candidato/postulaciones/{id_candidato}")
-def historial_candidato(id_candidato: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.id_postulacion, v.titulo, e.nombre AS empresa, p.fecha_postulacion,
-               COALESCE(p.estado_proceso, 'En revisión') AS estado,
-               COALESCE(m.afinidad, 78) AS afinidad
-        FROM postulaciones p
-        JOIN vacantes v ON p.id_vacante = v.id_vacante
-        JOIN empresas e ON v.id_empresa = e.id_empresa
-        LEFT JOIN matches m ON (m.id_candidato = p.id_candidato AND m.id_vacante = p.id_vacante)
-        WHERE p.id_candidato = %s
-        ORDER BY p.fecha_postulacion DESC;
-    """, (id_candidato,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
-
-# HU-07, HU-08: Swipes y Webhook
+# HU-RF-005, HU-RF-013 & HU-RNF-015: Swipe asíncrono
 @app.post("/api/swipes")
-def procesar_swipe(req: SwipeRequest):
-    conn = get_db()
-    cur = conn.cursor()
-    if req.decision == "like":
-        cur.execute("""
-            INSERT INTO postulaciones (id_candidato, id_vacante, estado, estado_proceso, fecha_postulacion)
-            VALUES (%s, %s, 'Postulado', 'En revisión', NOW())
-            ON CONFLICT DO NOTHING;
-        """, (req.id_candidato, req.id_vacante))
-        conn.commit()
+async def registrar_swipe(datos: SwipeInput, background_tasks: BackgroundTasks):
+    cursor.execute("""
+        INSERT INTO matches (id_candidato, id_vacante, decision, afinidad, fecha_interaccion)
+        VALUES (%s, %s, %s, NULL, CURRENT_TIMESTAMP)
+        ON CONFLICT (id_candidato, id_vacante) DO UPDATE
+        SET decision = EXCLUDED.decision, fecha_interaccion = CURRENT_TIMESTAMP;
+    """, (datos.id_candidato, datos.id_vacante, datos.decision))
+    db.commit()
 
-        if N8N_WEBHOOK_URL:
-            try:
-                requests.post(N8N_WEBHOOK_URL, json={"candidato_id": req.id_candidato, "vacante_id": req.id_vacante}, timeout=5)
-            except Exception:
-                pass
+    if datos.decision == "like":
+        # Dispara el Observer en background hacia n8n
+        background_tasks.add_task(notificar_observer_n8n, {
+            "evento": "postulacion",
+            "id_candidato": datos.id_candidato,
+            "id_vacante": datos.id_vacante,
+            "decision": datos.decision
+        })
 
-    cur.close()
-    conn.close()
-    return {"status": "ok", "decision": req.decision}
+    return {"mensaje": "Swipe procesado exitosamente"}
 
-# HU-05: Vacantes
-@app.post("/api/vacantes")
-def crear_vacante(req: VacanteRequest):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO vacantes (id_empresa, titulo, descripcion, requisitos, salario, modalidad, ubicacion, estado, fecha_publicacion)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'activa', NOW()) RETURNING id_vacante;
-    """, (req.id_empresa, req.titulo, req.descripcion, req.requisitos, req.salario, req.modalidad, req.ubicacion))
-    v_id = cur.fetchone()["id_vacante"]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"id_vacante": v_id, "mensaje": "Vacante publicada"}
+# HU-RF-011: Centro de Notificaciones In-App
+@app.get("/api/candidato/notificaciones/{id_usuario}")
+async def obtener_notificaciones(id_usuario: int):
+    cursor.execute("""
+        SELECT id_notificacion, id_usuario, tipo, titulo, mensaje, leida, enlace, fecha_creacion
+        FROM notificaciones
+        WHERE id_usuario = %s
+        ORDER BY fecha_creacion DESC LIMIT 30;
+    """, (id_usuario,))
+    columnas = [desc[0] for desc in cursor.description]
+    return [dict(zip(columnas, fila)) for fila in cursor.fetchall()]
 
-# HU-12: Panel de la Empresa
-@app.get("/api/empresa/postulaciones/{id_empresa}")
-def postulaciones_empresa(id_empresa: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.id_postulacion, u.nombre AS candidato_nombre, u.correo AS candidato_correo,
-               c.telefono, c.estudios, c.proyeccion, v.titulo AS vacante_titulo,
-               COALESCE(m.afinidad, 82) AS afinidad, COALESCE(hv.url_archivo, 'CV_Adjunto.pdf') AS cv_url,
-               p.estado_proceso
-        FROM postulaciones p
-        JOIN candidatos c ON p.id_candidato = c.id_candidato
-        JOIN usuarios u ON c.id_usuario = u.id_usuario
-        JOIN vacantes v ON p.id_vacante = v.id_vacante
-        LEFT JOIN matches m ON (m.id_candidato = p.id_candidato AND m.id_vacante = p.id_vacante)
-        LEFT JOIN hojas_vida hv ON hv.id_candidato = c.id_candidato
-        WHERE v.id_empresa = %s
-        ORDER BY afinidad DESC, p.fecha_postulacion DESC;
-    """, (id_empresa,))
-    res = cur.fetchall()
-    cur.close()
-    conn.close()
-    return res
+@app.put("/api/notificaciones/{id_notificacion}/leer")
+async def marcar_notificacion_leida(id_notificacion: int):
+    cursor.execute("UPDATE notificaciones SET leida = TRUE WHERE id_notificacion = %s RETURNING *;", (id_notificacion,))
+    db.commit()
+    return {"mensaje": "Notificación marcada como leída"}
+
+@app.put("/api/notificaciones/usuario/{id_usuario}/leer-todas")
+async def marcar_todas_leidas(id_usuario: int):
+    cursor.execute("UPDATE notificaciones SET leida = TRUE WHERE id_usuario = %s;", (id_usuario,))
+    db.commit()
+    return {"mensaje": "Todas las notificaciones fueron marcadas como leídas"}
+
+# HU-RF-009: Agenda de Entrevistas
+@app.get("/api/candidato/entrevistas/{id_candidato}")
+async def obtener_entrevistas_candidato(id_candidato: int):
+    cursor.execute("""
+        SELECT e.*, emp.nombre as empresa_nombre
+        FROM entrevistas e
+        JOIN empresas emp ON e.id_empresa = emp.id_empresa
+        WHERE e.id_candidato = %s
+        ORDER BY e.fecha_hora ASC;
+    """, (id_candidato,))
+    columnas = [desc[0] for desc in cursor.description]
+    return [dict(zip(columnas, fila)) for fila in cursor.fetchall()]
+
+@app.post("/api/empresa/entrevistas")
+async def agendar_entrevista_empresa(datos: EntrevistaInput, background_tasks: BackgroundTasks):
+    cursor.execute("""
+        INSERT INTO entrevistas (
+            id_postulacion, id_candidato, id_empresa, titulo, fecha_hora, 
+            duracion_minutos, modalidad, enlace_reunion, ubicacion, notas, estado
+        ) VALUES (%s, %s, %s, %s, %s, 45, %s, %s, %s, %s, 'programada')
+        RETURNING id_entrevista;
+    """, (
+        datos.id_postulacion, datos.id_candidato, datos.id_empresa,
+        datos.titulo, datos.fecha_hora, datos.modalidad,
+        datos.enlace_reunion, datos.ubicacion, datos.notas
+    ))
+    db.commit()
+    id_nueva = cursor.fetchone()[0]
+
+    # Genera notificación in-app en Neon
+    cursor.execute("SELECT id_usuario FROM candidatos WHERE id_candidato = %s;", (datos.id_candidato,))
+    row_user = cursor.fetchone()
+    if row_user:
+        cursor.execute("""
+            INSERT INTO notificaciones (id_usuario, tipo, titulo, mensaje, enlace)
+            VALUES (%s, 'entrevista', 'Nueva Entrevista Programada', %s, 'agenda');
+        """, (row_user[0], f"Tienes una entrevista programada: {datos.titulo} el {datos.fecha_hora.strftime('%d/%m/%Y %H:%M')}."))
+        db.commit()
+
+    # Dispara Observer hacia n8n para enviar correo al candidato
+    background_tasks.add_task(notificar_observer_n8n, {
+        "evento": "entrevista_agendada",
+        "id_candidato": datos.id_candidato,
+        "id_empresa": datos.id_empresa,
+        "titulo": datos.titulo,
+        "fecha_hora": datos.fecha_hora.strftime('%d/%m/%Y %H:%M'),
+        "modalidad": datos.modalidad,
+        "enlace_reunion": datos.enlace_reunion or "Por coordinar"
+    })
+
+    return {"mensaje": "Entrevista agendada exitosamente", "id_entrevista": id_nueva}
+
+@app.put("/api/entrevistas/{id_entrevista}/confirmar")
+async def confirmar_entrevista(id_entrevista: int):
+    cursor.execute("UPDATE entrevistas SET estado = 'confirmada' WHERE id_entrevista = %s;", (id_entrevista,))
+    db.commit()
+    return {"mensaje": "Entrevista confirmada"}
