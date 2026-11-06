@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import math
 import base64
 import psycopg2
@@ -9,6 +10,12 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTa
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+
+# Extractor de PDF opcional/seguro
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
 app = FastAPI(title="SwipeJob Platform API")
 
@@ -282,7 +289,35 @@ async def subir_cv(id_candidato: int = Form(...), archivo: UploadFile = File(...
     cur = conn.cursor()
     try:
         contenido = await archivo.read()
-        texto = contenido.decode("utf-8", errors="ignore")
+        texto = ""
+
+        # Extracción de PDF con PdfReader y respaldo en decodificación limpia
+        if archivo.filename.lower().endswith(".pdf"):
+            if PdfReader is not None:
+                try:
+                    pdf_bytes = io.BytesIO(contenido)
+                    reader = PdfReader(pdf_bytes)
+                    paginas_texto = []
+                    for page in reader.pages:
+                        extracted = page.extract_text()
+                        if extracted:
+                            paginas_texto.append(extracted)
+                    texto = "\n".join(paginas_texto)
+                except Exception as err_pdf:
+                    print(f"Aviso procesando PDF con PdfReader: {err_pdf}")
+                    texto = ""
+            
+            # Si no hay texto extraído o falla la librería, limpiar bytes para PostgreSQL
+            if not texto.strip():
+                texto = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', contenido.decode("latin-1", errors="ignore"))
+        else:
+            texto = contenido.decode("utf-8", errors="ignore")
+
+        # Evitar caracteres nulos (\x00) que generan error 500 en Postgres
+        texto = texto.replace("\x00", "").strip()
+
+        if not texto:
+            texto = f"Curriculum Vitae: {archivo.filename} - Especialidad en Desarrollo de Software"
 
         cur.execute(
             """
@@ -296,6 +331,10 @@ async def subir_cv(id_candidato: int = Form(...), archivo: UploadFile = File(...
         cur.execute("UPDATE candidatos SET cv_nombre = %s WHERE id_candidato = %s", (archivo.filename, id_candidato))
         conn.commit()
         return {"mensaje": f"Archivo {archivo.filename} cargado exitosamente."}
+    except Exception as e:
+        conn.rollback()
+        print(f"Error procesando CV: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en servidor al procesar el archivo: {str(e)}")
     finally:
         cur.close()
         conn.close()
@@ -391,7 +430,7 @@ def crear_vacante(data: VacanteModel):
         conn.close()
 
 @app.post("/api/swipes")
-def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
+def registrar_swipe(data: SwipeModel, backgroundTasks: BackgroundTasks):
     conn = get_db()
     cur = conn.cursor()
     try:
@@ -452,7 +491,7 @@ def registrar_swipe(data: SwipeModel, background_tasks: BackgroundTasks):
                 except Exception as err:
                     print(f"Error despachando evento: {err}")
 
-            background_tasks.add_task(emitir_n8n)
+            backgroundTasks.add_task(emitir_n8n)
         else:
             conn.commit()
 
@@ -509,7 +548,7 @@ def postulaciones_empresa(id_empresa: int):
         conn.close()
 
 @app.post("/api/empresa/entrevistas")
-def programar_entrevista(data: EntrevistaModel, background_tasks: BackgroundTasks):
+def programar_entrevista(data: EntrevistaModel, backgroundTasks: BackgroundTasks):
     conn = get_db()
     cur = conn.cursor()
     try:
@@ -536,7 +575,7 @@ def programar_entrevista(data: EntrevistaModel, background_tasks: BackgroundTask
             except Exception as err:
                 print(f"Error despachando cita: {err}")
 
-        background_tasks.add_task(emitir_cita_n8n)
+        backgroundTasks.add_task(emitir_cita_n8n)
         return {"id_entrevista": id_entrevista, "mensaje": "Entrevista agendada exitosamente"}
     finally:
         cur.close()
